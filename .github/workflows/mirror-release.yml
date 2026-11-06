@@ -1,0 +1,92 @@
+name: Mirror signed POS release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mirror-release.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '7,37 * * * *'
+
+# Publishing happens inside the public releases repository, so its own
+# GITHUB_TOKEN is sufficient. No cross-repository PAT is required.
+permissions:
+  contents: write
+
+concurrency:
+  group: pos-public-release-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror latest signed stable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SOURCE_REPO="tihloh/pos-source"
+          TARGET_REPO="$GITHUB_REPOSITORY"
+
+          # Read only a published, stable source release with a signed APK.
+          SOURCE_JSON="$(curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$SOURCE_REPO/releases/latest")"
+          TAG="$(jq -r '.tag_name // empty' <<< "$SOURCE_JSON")"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid source tag::Expected a stable vMAJOR.MINOR.PATCH source release."
+            exit 1
+          fi
+
+          APK="POS-$TAG.apk"
+          CHECKSUM="$APK.sha256"
+          APK_URL="$(jq -r --arg n "$APK" '.assets[] | select(.name == $n) | .browser_download_url' <<< "$SOURCE_JSON" | head -n 1)"
+          CHECKSUM_URL="$(jq -r --arg n "$CHECKSUM" '.assets[] | select(.name == $n) | .browser_download_url' <<< "$SOURCE_JSON" | head -n 1)"
+          EXPECTED_PREFIX="https://github.com/$SOURCE_REPO/releases/download/$TAG/"
+          if [[ "$APK_URL" != "$EXPECTED_PREFIX"* || "$CHECKSUM_URL" != "$EXPECTED_PREFIX"* ]]; then
+            echo "::error title=Source release incomplete::The signed APK and its checksum must be published by $SOURCE_REPO before mirroring."
+            exit 1
+          fi
+
+          TARGET_LATEST="$(gh api "repos/$TARGET_REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          if [ -n "$TARGET_LATEST" ] && [ "$TARGET_LATEST" != "$TAG" ]; then
+            HIGHEST="$(printf '%s\n' "${TARGET_LATEST#v}" "${TAG#v}" | sort -V | tail -n 1)"
+            if [ "$HIGHEST" = "${TARGET_LATEST#v}" ]; then
+              echo "Skipping $TAG: public latest $TARGET_LATEST is newer."
+              exit 0
+            fi
+          fi
+
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            ASSETS="$(gh release view "$TAG" --repo "$TARGET_REPO" --json assets --jq '.assets[].name')"
+            if grep -Fxq "$APK" <<< "$ASSETS" && grep -Fxq "$CHECKSUM" <<< "$ASSETS"; then
+              gh release edit "$TAG" --repo "$TARGET_REPO" --latest
+              echo "Already mirrored $TAG; no re-upload necessary."
+              exit 0
+            fi
+          fi
+
+          curl -fsSL --retry 3 "$APK_URL" -o "$APK"
+          curl -fsSL --retry 3 "$CHECKSUM_URL" -o "$CHECKSUM"
+          sha256sum --check "$CHECKSUM"
+
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$CHECKSUM" --repo "$TARGET_REPO" --clobber
+            gh release edit "$TAG" --repo "$TARGET_REPO" --latest
+          else
+            gh release create "$TAG" "$APK" "$CHECKSUM" \
+              --repo "$TARGET_REPO" \
+              --title "POS $TAG" \
+              --notes "Signed POS Android release mirrored from $SOURCE_REPO. The APK was verified against its SHA-256 checksum." \
+              --latest
+          fi
+
+          PUBLIC_LATEST="$(gh api "repos/$TARGET_REPO/releases/latest" --jq '.tag_name')"
+          PUBLIC_ASSETS="$(gh release view "$TAG" --repo "$TARGET_REPO" --json assets --jq '.assets[].name')"
+          if [ "$PUBLIC_LATEST" != "$TAG" ] || ! grep -Fxq "$APK" <<< "$PUBLIC_ASSETS"; then
+            echo "::error title=Update not published::The Android update endpoint does not expose $TAG and its APK."
+            exit 1
+          fi
+          echo "Published $TAG with signed APK in $TARGET_REPO; Android update discovery is ready."
