@@ -14,7 +14,7 @@ This repository is the public home for:
 - tutorials
 - release notes
 
-The application source code is maintained privately.
+The Kotlin Android source is maintained at [tihloh/pos-source](https://github.com/tihloh/pos-source). Signed APKs are built there and mirrored automatically into this repository's **Releases** section. Installed versions check this public release channel for updates.
 
 ## Highlights
 
